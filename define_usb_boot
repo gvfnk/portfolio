@@ -14,7 +14,7 @@ boot_dir=/boot
 # where flash drive will be mounted
 flash_mnt_dir=/root/flash
 # where flash image will be downloaded from
-flash_img_uri="http://192.168.241.2/flash_8g_sdb-backup.img.gz"
+flash_img_uri="http://where.to.get.image.com/flash_8g_sdb-backup.img.gz"
 # version of the new deb8 kernel which will be installed 
 new_kern_ver="3.16.7"
 # flash drive device by default
@@ -23,8 +23,8 @@ raw_ssd="/dev/sda"
 # size of new 3.+ kernel and initrd files Kb
 requiered_kern_size=10000
 
-deb8label=deb8wildix
-deb8labelrw2=wildix-rw2
+deb8label=deb8company
+deb8labelrw2=company-rw2
 
 node_name=`uname -n`
 kern_ver=`uname -r`

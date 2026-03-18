@@ -1,0 +1,486 @@
+#!/bin/bash
+set -x # uncomment for debug
+#set -e # break on each error
+
+# This sript must be run on host system - debian5 with grub1 installed and flash drive with deb8livroot label inserted into USB port
+# ./defile_usb_boot - set boot for usb_flash
+# ./define_usb_boot -r [last] - revert menu.lst back to first saved copy 
+# (if 'last' parameter set and this script was run multiple times then last saved copy of menu.lst will be restored)
+# backup dir is on flash drive (in /root/backup folder ) by default
+#
+############################################################################## init
+# default mnt dir for /dev/sda1 - boot
+boot_dir=/boot
+# where flash drive will be mounted
+flash_mnt_dir=/root/flash
+# where flash image will be downloaded from
+flash_img_uri="http://192.168.241.2/flash_8g_sdb-backup.img.gz"
+# version of the new deb8 kernel which will be installed 
+new_kern_ver="3.16.7"
+# flash drive device by default
+flash_dev="sdb"
+raw_ssd="/dev/sda"
+# size of new 3.+ kernel and initrd files Kb
+requiered_kern_size=10000
+
+deb8label=deb8wildix
+deb8labelrw2=wildix-rw2
+
+node_name=`uname -n`
+kern_ver=`uname -r`
+
+if [ "x$nodename" = "xdeb8livroot" ]
+then
+echo You have booted in live sysytem. No need to run this script
+echo $kern_ver
+exit
+fi
+
+############################################################################### sub definition
+# create unique log file in /root directory of flash drive
+# file is named after date in unix_seconds
+# make soft link to that file
+# set vars $log_file $backup_dir
+create_log_backdir()
+{
+#set -x
+cd ${flash_mnt_dir}/root/
+cur_date=`date +"%s"`
+log_file="${flash_mnt_dir}/root/set_boot_log.${cur_date}"
+#touch $log_file
+backup_dir="${flash_mnt_dir}/root/backup"
+mkdir -p $backup_dir
+
+#ln -s ${backup_dir} backup_last
+#ln -sf $log_file set_boot.log
+}
+
+###################################################
+# find /boot partition and mount it
+# check its free size for further decision
+# set vars $have_boot_dev $mounted_b $boot_sz $small_boot
+mount_boot()
+{
+#set -x 
+have_boot_dev=`cat /etc/fstab | awk ' /\/boot/ {print $1}'`
+if [ -z "$have_boot_dev" ]
+then
+echo !!!!!!!  no /boot in /etc/fstab set by default "/dev/sda1 /boot"
+boot_mnt_param="/dev/sda1 /boot"
+fi
+
+mounted_b=`mount | awk '/\/boot/ {print $3}'`
+
+if [ -z "$mounted_b" ]
+then
+# mount boot slice on /boot (usually /dev/hda1 )
+if [ -n $boot_mnt_param ]
+then
+mount -o rw /dev/sda1 /boot || (echo cant mount /boot, you may try to run fsck; exit 1 )
+else
+mount -o rw /boot || (echo cant mount /boot, you may try to run fsck; exit 1)
+fi # boot_mnt_param
+else
+# remount rw in case it was mounted ro
+boot_dir=$mounted_b
+mount -o remount,rw $boot_dir
+fi
+}
+
+###################################################
+# check if flash drive appeared in /dev/disk/by-label
+# mount flash drive to $flash_mnt_dir
+# set vars $flash_full_dev $flash_mnt_dir $grub_root flash_not_inserted
+
+chk_flash()
+{
+#set -x 
+if [ -b /dev/disk/by-label/deb8livroot ]
+then
+flash_dev=`ls -l /dev/disk/by-label/deb8livroot | grep -E -o "/[[:alnum:]]{3,}$"` 
+flash_full_dev="/dev${flash_dev}"
+
+# TODO: do we need to check multiple hdd situation?
+# sample code in case we have more then 1 hdd
+case $flash_dev in
+/sda1)
+root_dev=1
+;;
+/sdb1)
+root_dev=1
+;;
+*)
+echo '!!!!!!!!!!!!! cant determine device number Assuming it eq to (hd1,0)'
+root_dev=1
+esac
+
+# set boot device name for grub1
+grub_root="root (hd${root_dev},0)"
+
+# mount flash disk if it is not or set mount dir if it is
+flash_mnt_pnt=`mount | grep -w "$flash_full_dev" | awk '{print $3}'`
+if [ -z "$flash_mnt_pnt" ]
+then
+mkdir -p $flash_mnt_dir
+mount $flash_full_dev $flash_mnt_dir && eval flash_mnt_pnt=$flash_mnt_dir
+if [ "x$flash_mnt_dir" != "x$flash_mnt_pnt" ]
+then
+echo !!!!!!!!!! cant mount flash drive $flash_full_dev on  $flash_mnt_dir
+exit 1
+fi # cant mount
+else
+# already mounted
+flash_mnt_dir=$flash_mnt_pnt
+fi
+#echo flash_mnt_dir= $flash_mnt_dir  flash_full_dev= $flash_full_dev grub1_root= $grub_root
+else
+#
+flash_not_inserted=1
+echo  !!!!!!!!!! insert flash drive with deb8livroot label into USB port
+echo Or insert blank flash drive and run $0 -f [uri] to write image on it
+exit 1
+fi # if flash disk not found
+}
+###################################################
+#
+# revert menu.lst to previously backuped version
+# set vars  menu_reverted=1
+revert_cfg()
+{
+# if we have the same boot files as those on flash - remove them from /mnt/1/boot
+# we have not much space for multiple boot files!!!
+kern_file=`ls -1 ${flash_mnt_dir}/boot | awk '/vmlinuz/ {fname=$1} END {print fname}'`
+initrd_file=`ls -1 ${flash_mnt_dir}/boot | awk '/initrd.img/ {fname=$1} END {print fname}'`
+
+if [ -f ${boot_dir}/${kern_file} ]
+then
+rm ${boot_dir}/${kern_file}
+fi
+if [ -f ${boot_dir}/${initrd_file} ]
+then
+rm ${boot_dir}/${initrd_file}
+fi
+
+# $1 -  if parameter is set to 'last' - get back to last saved menu.lst NOT first (default) one
+#set -x 
+if [ "x$1" = "xlast" ]
+then
+#revert last saved menu.lst
+last_saved_menu=`ls -1 ${backup_dir} |sort | awk '/menu.lst.[0-9]+/ {fname=$1} END {print fname}'`
+cp ${backup_dir}/${last_saved_menu} ${boot_dir}/grub/menu.lst && menu_reverted=1
+else
+# revert default menu.lst
+if [ -f "${backup_dir}/menu.lst.default" ]
+then
+cp ${backup_dir}/menu.lst.default ${boot_dir}/grub/menu.lst && menu_reverted=1
+else
+# nothing to revert
+echo  !!!!!!!!!! no backup file menu.lst.default in $backup_dir 
+echo check manually another possibilities in
+ls -l ${backup_dir}
+fi # if have default
+fi # if last
+}
+#########################################
+# check if we have menu.lst 
+# and copy it to backup_dir ( with another filename if it is not a first run of this script )
+# vars set not_grub1 grub1_menu_backed
+backup_menu()
+{
+#set -x 
+if [ -f ${boot_dir}/grub/menu.lst ]
+then
+# we have grub1 menu config. Great!
+#backup all changed files
+
+if [ -f "${backup_dir}/menu.lst.default" ]
+then
+#not a first run of the init script
+#cur_date=`date +"%s"`
+cp ${boot_dir}/grub/menu.lst ${backup_dir}/menu.lst.${cur_date} && grub1_menu_backed=1
+else
+cp ${boot_dir}/grub/menu.lst ${backup_dir}/menu.lst.default && grub1_menu_backed=1
+cp ${boot_dir}/grub/menu.lst ${backup_dir}/menu.lst.${cur_date} && grub1_menu_backed=1
+fi
+
+if [ "x$grub1_menu_backed" = "x" ]
+then
+echo  !!!!!!!!!! smth goes wrong!! cant save menu.lst to ${backup_dir}
+exit
+fi
+
+else
+# we dont see menu.lst
+not_grub1=1
+echo  !!!!!!!!!! have not grub1 installed !!!!!!!!!!!!!
+exit 1
+fi # have menu.lst fi
+}
+##########################################
+backup_etc_net()
+{
+
+# all etc changed
+tar czvf ${backup_dir}/etc-backup.${cur_date}.tgz /rw/etc /rw2/etc 
+
+# all net dir and misc services
+tar czvhf ${backup_dir}/etc-network-backup.${cur_date}.tgz /etc/network /etc/ntp.* /etc/hosts /etc/hostname 
+
+#sshd
+if [ -d /etc/ssh ]
+then
+tar czvhf ${backup_dir}/etc-ssh-backup.${cur_date}.tgz /etc/ssh
+fi
+
+# openvpn
+if [ -d /etc/openvpn ]
+then
+tar czvhf ${backup_dir}/etc-ovpn-backup.${cur_date}.tgz /etc/openvpn /etc/default/openvpn
+fi
+
+# ppp
+if [ -d /etc/ppp ]
+then
+tar czvhf ${backup_dir}/etc-ppp-backup.${cur_date}.tgz /etc/ppp
+fi
+
+# dnsmask & dhcp
+if [ -d /etc/dnsmasq.d ]
+then
+tar czvhf ${backup_dir}/etc-dnsmasq-backup.${cur_date}.tgz /etc/dnsmasq.d /etc/dnsmasq.conf
+fi
+
+#interfaces
+cp /etc/network/interfaces ${backup_dir}/interfaces.${cur_date}
+cp /etc/resolv.conf ${backup_dir}/resolv.conf.${cur_date}
+cp /etc/hostname ${backup_dir}/hostname.${cur_date}
+cp /etc/hosts ${backup_dir}/hosts.${cur_date}
+
+#iptables ifplugd
+cp /etc/default/iptables  ${backup_dir}/iptables.${cur_date}
+cp /etc/default/ifplugd  ${backup_dir}/ifplugd.${cur_date}
+
+# mac addresses
+ifconfig -a | awk '/Ethernet/ {print $1, $5}' > ${backup_dir}/mactab
+
+
+}
+##########################################
+# add/change strings in menu.lst to set boot from flash drive with deb8livroot label by default
+# or fall back to 0 (first line of menu)
+set_flash_boot()
+{
+#set -x 
+cat ${backup_dir}/menu.lst.default | grep -v -E "^default|^fallback" >${backup_dir}/menu.lst-tmp
+# add link to boot new kernel and root from usb flash
+cat <<EOC >>  ${backup_dir}/menu.lst-tmp
+
+title usb flash
+${grub_root}
+kernel /boot/vmlinuz-3.16.0-4-586 root=/dev/disk/by-label/deb8livroot rw console=ttyS0,19200 panic=1
+initrd /boot/initrd.img-3.16.0-4-586
+boot
+EOC
+
+# set default boot
+def_title=`cat  ${backup_dir}/menu.lst-tmp | awk ' /^title/ {count=count+1} /^title usb flash/ {set_def= count-1} END {print set_def }'`
+awk_c="cat  ${backup_dir}/menu.lst-tmp | awk ' /^title/ {count=count+1} /^title .*$kern_ver/ {set_def= count-1} END {print set_def }'"
+prev_title=`eval $awk_c`
+
+echo default $def_title  > ${backup_dir}/menu.lst-new
+echo fallback $prev_title  >>${backup_dir}/menu.lst-new
+#echo "# previous_default=$prev_title" >>${backup_dir}/menu.lst-new
+echo serial --unit=0 --speed=19200  >>${backup_dir}/menu.lst-new
+echo terminal --timeout=5 serial console >>${backup_dir}/menu.lst-new
+echo "" >>${backup_dir}/menu.lst-new
+cat ${backup_dir}/menu.lst-tmp  >>${backup_dir}/menu.lst-new
+
+# alternative way to rewrite menu.lst
+#eval "cat  ${boot_dir}/grub/menu.lst | grep -v -E "^fallback" | sed -e 's/^default.*$/default $def_title\\nfallback 0\\n/'" >${backup_dir}/menu.lst-new
+
+cp ${backup_dir}/menu.lst-new ${boot_dir}/grub/menu.lst
+
+}
+##########################################
+# add/change strings in menu.lst to set boot from flash drive with deb8livroot label by default
+# or fall back to 0 (first line of menu)
+set_flash_boot_bios()
+{
+# copy deb8 boot files from flash to boot dir on SSD
+cat ${backup_dir}/menu.lst2.default | grep -v -E "^default|^fallback" >${backup_dir}/menu.lst-tmp
+
+# set filenames for kernel and initrd aftre files stored in $new_boot_files
+kern_file=`ls -1 ${flash_mnt_dir}/boot | awk '/vmlinuz/ {fname=$1} END {print fname}'`
+initrd_file=`ls -1 ${flash_mnt_dir}/boot | awk '/initrd.img/ {fname=$1} END {print fname}'`
+
+cp ${flash_mnt_dir}/boot/${kern_file} ${boot_dir} || (echo cant copy new kernel to /boot partition ; exit 1)
+cp ${flash_mnt_dir}/boot/${initrd_file} ${boot_dir} || (echo cant copy new initrd to /boot partition ; exit 1)
+
+#set -x 
+cat ${backup_dir}/menu.lst.default | grep -v -E "^default|^fallback" >${backup_dir}/menu.lst-tmp
+# add link to boot new kernel and root from usb flash
+cat <<EOC >>  ${backup_dir}/menu.lst-tmp
+
+title usb flash-boot-bypass-bios
+root (hd0,0)
+kernel /${kern_file} root=/dev/disk/by-label/deb8livroot rw console=ttyS0,19200 panic=1
+initrd /${initrd_file}
+boot
+EOC
+
+# set default boot
+def_title=`cat  ${backup_dir}/menu.lst-tmp | awk ' /^title/ {count=count+1} /^title usb flash-boot-bypass-bios/ {set_def= count-1} END {print set_def }'`
+awk_c="cat  ${backup_dir}/menu.lst-tmp | awk ' /^title/ {count=count+1} /^title .*$kern_ver/ {set_def= count-1} END {print set_def }'"
+prev_title=`eval $awk_c`
+
+echo default $def_title  > ${backup_dir}/menu.lst-new
+echo fallback $prev_title  >>${backup_dir}/menu.lst-new
+#echo "# previous_default=$prev_title" >>${backup_dir}/menu.lst-new
+echo serial --unit=0 --speed=19200  >>${backup_dir}/menu.lst-new
+echo terminal --timeout=5 serial console >>${backup_dir}/menu.lst-new
+echo "" >>${backup_dir}/menu.lst-new
+cat ${backup_dir}/menu.lst-tmp  >>${backup_dir}/menu.lst-new
+
+# alternative way to rewrite menu.lst
+#eval "cat  ${boot_dir}/grub/menu.lst | grep -v -E "^fallback" | sed -e 's/^default.*$/default $def_title\\nfallback 0\\n/'" >${backup_dir}/menu.lst-new
+
+cp ${backup_dir}/menu.lst-new ${boot_dir}/grub/menu.lst
+
+}
+##########################################
+# set net config of flash live system accoring to base system
+# 
+# restore net configs
+# $1 - where backup is 
+# $2 - destination dir, where new partition is mounted
+# $3 - if set - then we will restore not a last done backup, but the one is specified by unix_time_sec()
+restore_net_conf()
+{
+# 
+#backup_dir=$1 # we already set this globaly
+dest_dir=$1
+date_backup=$2
+
+# enable forwarding
+echo "net.ipv4.ip_forward = 1" >> ${dest_dir}/etc/sysctl.conf
+
+if [ "x$date_backup" = "x" ]
+then
+# last saved backup
+saved_ssh=${backup_dir}/`ls -1 ${backup_dir} |sort | awk '/etc-ssh-backup.[0-9]+.tgz/ {fname=$1} END {print fname}'`
+saved_ovpn=${backup_dir}/`ls -1 ${backup_dir} |sort | awk '/etc-ovpn-backup.[0-9]+.tgz/ {fname=$1} END {print fname}'`
+saved_ppp=${backup_dir}/`ls -1 ${backup_dir} |sort | awk '/etc-ppp-backup.[0-9]+.tgz/ {fname=$1} END {print fname}'`
+saved_dns=${backup_dir}/`ls -1 ${backup_dir} |sort | awk '/etc-dnsmasq-backup.[0-9]+.tgz/ {fname=$1} END {print fname}'`
+saved_inf=${backup_dir}/`ls -1 ${backup_dir} |sort | awk '/interfaces.[0-9]+/ {fname=$1} END {print fname}'`
+saved_resolv=${backup_dir}/`ls -1 ${backup_dir} |sort | awk '/resolv.conf.[0-9]+/ {fname=$1} END {print fname}'`
+saved_iptables=${backup_dir}/`ls -1 ${backup_dir} |sort | awk '/iptables.[0-9]+/ {fname=$1} END {print fname}'`
+saved_ifplugd=${backup_dir}/`ls -1 ${backup_dir} |sort | awk '/ifplugd.[0-9]+/ {fname=$1} END {print fname}'`
+saved_hostname=${backup_dir}/`ls -1 ${backup_dir} |sort | awk '/hostname.[0-9]+/ {fname=$1} END {print fname}'`
+saved_hosts=${backup_dir}/`ls -1 ${backup_dir} |sort | awk '/hosts.[0-9]+/ {fname=$1} END {print fname}'`
+
+else
+# if backup version is specified explicitly
+saved_ssh="${backup_dir}/etc-ssh-backup.${date_backup}.tgz"
+saved_ovpn="${backup_dir}/etc-ovpn-backup.${date_backup}.tgz"
+saved_ppp="${backup_dir}/etc-ppp-backup.${date_backup}.tgz"
+saved_dns="${backup_dir}/etc-dnsmasq-backup.${date_backup}.tgz"
+saved_inf="${backup_dir}/interfaces.${date_backup}"
+saved_resolv="${backup_dir}/resolv.conf.${date_backup}"
+saved_iptables="${backup_dir}/iptables.${date_backup}"
+saved_ifplugd="${backup_dir}/ifplugd.${date_backup}"
+saved_hostname="${backup_dir}/hostname.${date_backup}"
+saved_hosts="${backup_dir}/hosts.${date_backup}"
+
+fi
+
+# sshd
+tar xzv -C ${dest_dir} -f ${saved_ssh}
+# ovpn
+tar xzv -C ${dest_dir} -f ${saved_ovpn}
+# ppp
+tar xzv -C ${dest_dir} -f ${saved_ppp}
+
+# dns and nat
+# TODO: remove /rw2/ from config files, change /etc/dnsmasq.d/resolv.conf to smth appropriate
+# /etc/init.d/dnsmasq restart
+tar xzv -C ${dest_dir} -f ${saved_dns}
+
+#interfaces
+cp ${saved_inf} ${dest_dir}/etc/network/interfaces
+cp ${saved_resolv} ${dest_dir}/etc/resolv.conf
+
+#iptables ifplugd
+cp ${saved_iptables} ${dest_dir}/etc/network/iptables
+cp ${saved_ifplugd} ${dest_dir}/etc/network/ifplugd
+
+#cp ${saved_hostname} ${dest_dir}/etc/hostname
+#cp ${saved_hosts} ${dest_dir}/etc/hosts
+
+# TODO: fstab check
+
+# mac addresses (this file has only one version)
+cp ${backup_dir}/mactab ${dest_dir}/etc/mactab
+
+cat << EON >${dest_dir}/etc/network/if-pre-up.d/nameif
+#!/bin/sh
+PATH=/sbin
+nameif -c /etc/mactab
+EON
+
+chmod +x ${dest_dir}/etc/network/if-pre-up.d/nameif
+
+}
+######################################
+write_flash_img()
+{
+echo insert USB flash drive in USB port and press  Enter
+read ans
+
+if [ -b /dev/sdb ]
+then
+echo We are going to download image and write it on flash drive
+echo Press Enter if ready or ctrl-C to  stop
+read ans
+
+if curl --output /dev/null --silent --head --fail "${flash_img_uri}"; then
+eval "curl -o - ${flash_img_uri} | dd of=/dev/sdb bs=4M conv=notrunc"
+else
+  echo "URL does not exist: ${flash_img_uri}"
+fi
+partprobe /dev/sdb
+#ssh ${flash_img_uri} "dd if=flash_8g_sdb-backup.img.gz" | gzip -dc | dd of=/dev/sdb bs=10M conv=notrunc
+else
+echo USB flash drive not found
+fi
+exit
+}
+################################################################################  main
+
+if [ "x$1" = "x-f" ]
+then
+if [ -n "$2" ]
+then
+flash_img_uri="$2"
+fi
+write_flash_img
+fi
+
+chk_flash && echo flash checked
+create_log_backdir && echo backdir created
+mount_boot && echo "/boot mounted"
+
+if [ "x$1" = "x-r" ]
+then
+revert_cfg $2
+exit
+fi # revert config and exit
+
+backup_menu && echo menu backed
+if [ "x$1" = "x-b" ]
+then
+set_flash_boot && echo flash set boot
+else
+set_flash_boot_bios && echo flash set boot bypass bios
+fi # bypass bios
+backup_etc_net && echo etc backuped
+restore_net_conf ${flash_mnt_dir} && echo -e "!!!!!!!!!!!!!!!!!!!!!!!\nBackup of config files succeeded, you may run reboot now. \nLive system will be booted if you have the flash-drive in USB or the old system if you remove it from USB"

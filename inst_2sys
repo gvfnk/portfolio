@@ -1,0 +1,611 @@
+#!/bin/bash
+set -x # uncomment for debug
+#set -e # break on each error
+
+############################################################################## init
+# default mnt dir for ${raw_ssd}1 - boot
+boot_dir=/boot
+
+if [ "x$1" = "x-h" ]
+then
+shift
+web_host=$1
+shift
+else
+web_host=192.168.241.8
+fi
+# deb5 kernel for ext4 file archove
+deb5_kern_uri="http://${web_host}/kernel-deb5-ext4.tgz"
+# deb8 root fs tar.gz file archove
+deb8_root_uri="http://${web_host}/system-deb8-root.tgz"
+# rw2 for new deb8 tar.gz file archive
+deb8_rw2_uri="http://${web_host}/system-deb8-rw2.tgz"
+# deb5 kernel for ext4 file archove
+deb8_kern_uri="http://${web_host}/deb8-kern-boot.tgz"
+
+# version of the new deb8 kernel which will be installed 
+new_kern_ver="3.16.7"
+raw_ssd=`mount | grep -w "/rw2" | awk '{print $1}' | tr -d 0-9`
+raw_ssd8="/dev/sda"
+# size of new 3.+ kernel and initrd files Kb
+requiered_kern_size=10000
+# partition size which will be sliced for new system root (${raw_ssd}5), the rest of SSD will be occupied by rw2 (${raw_ssd}6)
+new_system_size_mb=750 # sda5
+new_rw2_size_mb=250  # sda6
+# requiered free space on SSD for new system Mb
+required_part_size=`expr $new_rw2_size_mb + $new_system_size_mb`
+
+# labels for new partitions
+deb8label=deb8wildix
+deb8labelrw2=wildix-rw2
+
+node_name=`uname -n`
+kern_ver=`uname -r`
+cur_date=`date +"%s"`
+
+if [ "x$nodename" = "xdeb8livroot" ]
+then
+echo You have booted in live sysytem. No need to run this script
+echo $kern_ver
+exit
+fi
+
+############################################################################### sub definition
+#########################################################################################################################
+# find /boot partition and mount it
+# check its free size for further decision
+# set vars $have_boot_dev $mounted_b $boot_sz $small_boot
+mount_boot()
+{
+#set -x 
+have_boot_dev=`cat /etc/fstab | awk ' /\/boot/ {print $1}'`
+if [ -z "$have_boot_dev" ]
+then
+echo !!!!!!!  no /boot in /etc/fstab set by default "${raw_ssd}1 /boot"
+boot_mnt_param="${raw_ssd}1 /boot"
+fi
+
+mounted_b=`mount | awk '/\/boot/ {print $3}'`
+
+if [ -z "$mounted_b" ]
+then
+# mount boot slice on /boot (usually /dev/hda1 )
+if [ -n $boot_mnt_param ]
+then
+mount -o rw ${raw_ssd}1 /boot || (echo cant mount /boot, you may try to run fsck; exit 1 )
+else
+mount -o rw /boot || (echo cant mount /boot, you may try to run fsck; exit 1)
+fi # boot_mnt_param
+else
+# remount rw in case it was mounted ro
+boot_dir=$mounted_b
+mount -o remount,rw $boot_dir
+fi
+}
+##########################################
+install_deb5_kernel_ext4()
+{
+# $1 - dest dir
+dest_dir=$1
+
+# Do this unless we already have these files in /boot
+have_kern=`ls -1 ${dest_dir} | awk '/vmlinuz-2.6.*-ext4/ {fname=$1} END {print fname}'`
+if [ -z "$have_kern" ]
+then
+echo We are going to download and untar new kernel
+echo make sure you have network access
+echo Press Enter if ready or ctrl-C to  stop
+read ans
+
+if curl --output /dev/null --silent --head --fail "${deb5_kern_uri}"; then
+eval "curl -o - ${deb5_kern_uri} | tar xz -C ${dest_dir} -f -"
+else
+echo Can not install kernel with ext4
+  echo "URL does not exist: ${deb5_kern_uri}"
+exit 1
+fi
+
+else # we have kernel
+echo You already have kernel with ext4 support
+fi
+}
+##########################################
+# add/change strings in menu.lst to set boot from flash drive with deb8livroot label by default
+# or fall back to 0 (first line of menu)
+set_ext4_boot()
+{
+
+# do changes unless we already have the menu item booting new kernel with -ext4 suffix
+
+have_ext4_item=`grep -E "vmlinuz-2.6.*-ext4" ${boot_dir}/grub/menu.lst`
+
+if [ -z "$have_ext4_item" ]
+then
+kern_file=`ls -1 ${boot_dir} | awk '/vmlinuz-2.6.*-ext4/ {fname=$1} END {print fname}'`
+
+cat ${boot_dir}/grub/menu.lst | grep -v -E "^default|^fallback" > ${boot_dir}/grub/menu.lst-new
+if [ -f "${boot_dir}/grub/menu.lst.backup" ]
+then
+echo You already have menu backup
+else
+cp  ${boot_dir}/grub/menu.lst  ${boot_dir}/grub/menu.lst.backup
+fi
+# add new menu item
+cat <<EOC >>  ${boot_dir}/grub/menu.lst-new
+
+title  ${kern_file} ext4 enabled
+root    (hd0,0)
+kernel    /${kern_file} root=${raw_ssd}2 ro console=ttyS0,19200 panic=1
+savedefault
+boot
+EOC
+
+# set default boot
+def_title=`cat  ${boot_dir}/grub/menu.lst-new | awk ' /^title/ {count=count+1} /^title .*ext4 enabled/ {set_def= count-1} END {print set_def }'`
+prev_title=0
+
+echo default $def_title  >  ${boot_dir}/grub/menu.lst
+echo fallback $prev_title  >> ${boot_dir}/grub/menu.lst
+
+#echo serial --unit=0 --speed=19200  >> ${boot_dir}/grub/menu.lst
+#echo terminal --timeout=5 serial console >> ${boot_dir}/grub/menu.lst
+echo "" >> ${boot_dir}/grub/menu.lst
+cat  ${boot_dir}/grub/menu.lst-new  >> ${boot_dir}/grub/menu.lst
+rm  ${boot_dir}/grub/menu.lst-new
+
+echo "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
+echo "!!!!!!!!!                  You should reboot NOW to check the new kernel"
+echo "!!!!!!!!!           Do NOT run this script again until reboot"
+echo "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
+exit
+else
+echo We already have ext4 enabled kernel in boot menu
+#echo You may delete old kernel (not ext4 enabled)
+# TODO: ask and delete old files and menu item
+fi # have ext4 item
+}
+#########################################
+#  compare boot part size with new kernel and initrd image
+chk_boot_size()
+{
+
+boot_part_free_size_k=`df -k /boot | awk '/dev/ {print $4}' `
+
+# TODO get new deb8 kernel size
+#new_boot_size_k=`du -sk ${new_boot_files} | awk '{print $1}'`
+# set the new kern size by hands
+new_boot_size_k=10000
+# check if we already have this kern files in /boot (in case of multiple run of this script)
+new_kern_size_k=`du -sk /boot/*${new_kern_ver}* 2>/dev/null | awk '{sum=sum+$1} END {print sum}'`
+# add the space occupied by this files since we overwrite them without additional space allocation
+boot_free_all=`expr $boot_part_free_size_k + $new_kern_size_k + 12`
+if [ $boot_free_all -lt $new_boot_size_k ]
+then
+echo Boot partition size is too small to for new kernel
+echo We have $boot_free_all kbytes but need $new_boot_size kbytes
+echo Cant install new system along with old one. The new system will overwrite the old one.
+exit 1
+fi
+}
+#########################################
+# to /boot
+#$1 - where kernel files are placed on newly untared partition
+copy_deb8_kern()
+{
+cp $1/vmlinuz-3* /boot
+cp $1/initrd.img-3* /boot
+cp $1/System.map* /boot
+}
+#########
+# to /boot
+#$1 - destination where to place kernel files
+copy_deb8_kern_net()
+{
+
+if curl --output /dev/null --silent --head --fail "${deb8_kern_uri}"; then
+eval "curl -o - ${deb8_kern_uri} | tar xz -C $1 -f -"
+else
+  echo "URL does not exist: ${deb8_kern_uri}"
+exit 1
+fi
+}
+##########################################
+# add/change strings in menu.lst to set boot from flash drive with deb8livroot label by default
+# or fall back to 0 (first line of menu)
+set_deb8_boot()
+{
+
+# do changes unless we already have the menu item booting new kernel with Debian8 string in title
+
+have_deb8_item=`grep -E "Debian8" ${boot_dir}/grub/menu.lst`
+
+if [ -z "$have_deb8_item" ]
+then
+kern_file=`ls -1 ${boot_dir} | awk '/vmlinuz-3/ {fname=$1} END {print fname}'`
+initrd_file=`ls -1 ${boot_dir} | awk '/initrd.img-3/ {fname=$1} END {print fname}'`
+
+cat ${boot_dir}/grub/menu.lst | grep -v -E "^default|^fallback" > ${boot_dir}/grub/menu.lst-new
+
+if [ -f " ${boot_dir}/grub/menu.lst2.backup" ]
+then
+echo You already have menu backup
+else
+cp  ${boot_dir}/grub/menu.lst  ${boot_dir}/grub/menu.lst2.backup
+fi
+
+# add new menu item
+cat <<EOC >>  ${boot_dir}/grub/menu.lst-new
+
+title  ${kern_file} Debian8
+root    (hd0,0)
+kernel    /${kern_file} root=${raw_ssd8}5 ro console=ttyS0,19200 panic=1
+initrd    /${initrd_file}
+savedefault
+boot
+EOC
+
+# set default boot
+def_title=`cat  ${boot_dir}/grub/menu.lst-new | awk ' /^title/ {count=count+1} /^title .*Debian8/ {set_def= count-1} END {print set_def }'`
+awk_c="cat  ${boot_dir}/grub/menu.lst2.backup | awk ' /^default/ {prev_def=\$2} /^fallback/ {print prev_def, \$2, \$3, \$4}'"
+prev_title=`eval $awk_c`
+
+echo default $def_title  >  ${boot_dir}/grub/menu.lst
+echo fallback $prev_title  >> ${boot_dir}/grub/menu.lst
+
+echo "" >> ${boot_dir}/grub/menu.lst
+cat  ${boot_dir}/grub/menu.lst-new  >> ${boot_dir}/grub/menu.lst
+rm  ${boot_dir}/grub/menu.lst-new
+
+echo "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
+echo "!!!!!!!!!                  You should reboot NOW to check the new kernel"
+echo "!!!!!!!!!           Do NOT run this script again until reboot"
+echo "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
+exit
+else
+echo We already have Debian8 kernel in boot menu
+#echo You may delete old kernel (not ext4 enabled)
+# TODO: ask and delete old files and menu item
+fi # have ext4 item
+}
+
+##########################################
+# check 3 conditions for var_a install
+# 1. Boot size is OK to store new kernel and initrd
+# 2. partitions less then 4
+# 3. SSD size bigger then requiered
+chk_free_ssd()
+{
+# number of partitions
+parts_cnt=`fdisk -l ${raw_ssd} | grep -E "^${raw_ssd}" | wc -l`
+if [ $parts_cnt -gt 3 ]
+then
+echo You have $parts_cnt partitions on your SSD, which is more then 3,
+echo Cant install new system along with old one. The new system will overwrite the old one.
+exit 1
+else # partitions less then 4, its OK for var "a" install
+echo Its Ok, we have less the 4 partitions on the disk.
+
+# check free space on SSD
+free_ssd_m=`parted ${raw_ssd} unit B print free | awk '/Free Space/ {print int($3/1024/1024)}' | tail -n 1` && echo free_ssd_m=$free_ssd_m
+if [ $free_ssd_m -lt $required_part_size ]
+then
+echo You have $free_ssd_m MBytes free on SSD which is smaller then required $required_part_size MBytes,
+echo Cant install new system along with old one. The new system will overwrite the old one.
+exit 1
+else # ssd space is enough
+echo We have enough space on disk for the new system
+fi # free_ssd_m
+fi # parts_cnt
+}
+#####################################
+# Create 4th partition and ext4 FS on it labeled 'deb8wildix'
+# then mount it on /mnt/4
+create_new_part()
+{
+#$1 - new mount point
+
+deb8_mnt=$1
+
+# create new with parted
+# starting point of new  part
+start_mb=`parted -s ${raw_ssd} unit MB print free | awk '/Free Space/ {print $1}' | tail -n 1`
+end_mb=`parted -s ${raw_ssd} unit MB print free | awk -v ns=${new_system_size_mb} '/Free Space/ {print $1+ns"M"}' | tail -n 1`
+if [ "$start_mb" = "0.00MB" ]
+then
+echo no free space on device ${raw_ssd}
+echo no free space on device ${raw_ssd} >> ${error_log}
+exit 1
+fi
+
+extended_part_end=`echo " "| awk -vstart=$start_mb  -vext_size=$required_part_size '{print ( start + ext_size) }' `
+# create new ext partition and two logical ones inside, size of system part is set on start of this script in ${new_system_size_mb} variable
+parted -s ${raw_ssd} mkpart ext ${start_mb} ${extended_part_end}MB
+partprobe ${raw_ssd}
+
+parted -s ${raw_ssd} mkpartfs logic ext2  ${start_mb} ${end_mb}MB
+parted -s ${raw_ssd} mkpartfs logic ext2 ${end_mb} ${extended_part_end}MB
+
+# wait some time
+count=0
+until [ -b ${raw_ssd}6 -a -b ${raw_ssd}5 -o "$count" = "5" ]
+do
+count=`expr $count + 1`
+partprobe ${raw_ssd}
+done
+
+parted -s ${raw_ssd} print free
+
+mkfs.ext4 -L ${deb8label} -q -FF ${raw_ssd}5 || exit 1
+mkfs.ext4 -L ${deb8labelrw2} -q -FF ${raw_ssd}6 || exit 1
+
+mkdir -p ${deb8_mnt}
+mount ${raw_ssd}5 ${deb8_mnt} || ( echo system part not  mounted; exit 1)
+mkdir -p ${deb8_mnt}/rw2
+mount ${raw_ssd}6 ${deb8_mnt}/rw2 || ( echo rw2 part not mounted; exit 1)
+
+is_mnt_pnt=`mount | grep -w "${raw_ssd}5"`
+is_mnt_pnt2=`mount | grep -w "${raw_ssd}6"`
+# last check!
+if [ -z "${is_mnt_pnt}" ]
+then
+echo ${deb8_mnt} file system not mounted
+exit 1.
+fi
+if [ -z "${is_mnt_pnt2}" ]
+then
+echo ${deb8_mnt}/rw2 file system not mounted
+exit 1.
+fi
+}
+#########################################
+populate_deb8_fs()
+{
+# $1 - dest dir
+dest_dir=$1
+echo We are going to download and unter new system image
+echo make sure you have network access
+echo Press Enter if ready or ctrl-C to  stop
+read ans
+
+if curl --output /dev/null --silent --head --fail "${deb8_root_uri}"; then
+eval "curl -o - ${deb8_root_uri} | tar xz -C ${dest_dir} -f -"
+else
+echo Cant download root image of new system
+  echo "URL does not exist: ${deb8_root_uri}"
+exit 1
+fi
+
+if curl --output /dev/null --silent --head --fail "${deb8_rw2_uri}"; then
+eval "curl -o - ${deb8_rw2_uri} | tar xz -C ${dest_dir} -f -"
+else
+  echo "URL does not exist: ${deb8_rw2_uri}"
+#exit 1
+fi
+}
+######################################
+backup_etc_net()
+{
+# $1 - backup dir - should be on new partition
+backup_dir=$1
+
+mkdir -p ${backup_dir}
+
+# all etc changed
+tar czf ${backup_dir}/etc-backup.${cur_date}.tgz /rw/etc /rw2/etc 
+
+# all net dir and misc services
+tar czhf ${backup_dir}/etc-network-backup.${cur_date}.tgz /etc/network /etc/ntp.* /etc/hosts /etc/hostname 
+
+#sshd
+if [ -d /etc/ssh ]
+then
+tar czhf ${backup_dir}/etc-ssh-backup.${cur_date}.tgz /etc/ssh
+fi
+
+# openvpn
+if [ -d /etc/openvpn ]
+then
+tar czhf ${backup_dir}/etc-ovpn-backup.${cur_date}.tgz /etc/openvpn /etc/default/openvpn
+fi
+
+# ppp
+if [ -d /etc/ppp ]
+then
+tar czhf ${backup_dir}/etc-ppp-backup.${cur_date}.tgz /etc/ppp
+fi
+
+# dnsmask & dhcp
+if [ -d /etc/dnsmasq.d ]
+then
+tar czhf ${backup_dir}/etc-dnsmasq-backup.${cur_date}.tgz /etc/dnsmasq.d /etc/dnsmasq.conf
+fi
+
+#interfaces
+cp /etc/network/interfaces ${backup_dir}/interfaces
+cp /etc/resolv.conf ${backup_dir}/resolv.conf
+cp /etc/hostname ${backup_dir}/hostname
+cp /etc/hosts ${backup_dir}/hosts
+
+#iptables ifplugd
+cp /etc/default/iptables  ${backup_dir}/iptables
+cp /etc/default/ifplugd  ${backup_dir}/ifplugd
+
+# mac addresses
+#ifconfig -a | awk '/Ethernet/ {print $1, $5}' > ${backup_dir}/mactab
+#ifconfig -a | awk '/Ethernet/ {print p$1, $5}' > ${backup_dir}/mactab1
+
+# udev way to keep ether name static
+#KERNEL=="eth*", SYSFS{address}=="00:12:34:fe:dc:ba", NAME="eth0" >> /etc/udev/rules.d/010_netinterfaces.rules
+#ifconfig -a | awk '/Ethernet/ {print "KERNEL==\"eth*\", SYSFS{address}==\""$5"\", NAME=\"" $1"\""}' > ${backup_dir}/70-persistent-net.rules
+ifconfig -a | awk '/Ethernet/ {print "SUBSYSTEM==\"net\", ACTION==\"add\", DRIVERS==\"?*\", ATTR{address}==\""$5"\", ATTR{type}==\"1\", KERNEL==\"eth*\", NAME=\""$1"\""}' > ${backup_dir}/70-persistent-net.rules
+
+
+}
+##########################################
+# restore net configs chrooted
+# $1 - where backup is 
+# $2 - destination dir, where new partition is mounted
+# $3 - if set - then we will restore not a last done backup, but the one is specified by unix_time_sec()
+restore_net_conf_chroot()
+{
+# 
+backup_dir=$1
+dest_dir=$2
+date_backup=$3
+
+# enable forwarding
+echo "net.ipv4.ip_forward = 1" >> ${dest_dir}/etc/sysctl.conf
+
+if [ "x$date_backup" = "x" ]
+then
+# last saved backup
+saved_ssh=`ls -1 ${backup_dir} |sort | awk '/etc-ssh-backup.[0-9]+.tgz/ {fname=$1} END {print fname}'`
+saved_ovpn=`ls -1 ${backup_dir} |sort | awk '/etc-ovpn-backup.[0-9]+.tgz/ {fname=$1} END {print fname}'`
+saved_ppp=`ls -1 ${backup_dir} |sort | awk '/etc-ppp-backup.[0-9]+.tgz/ {fname=$1} END {print fname}'`
+saved_dns=`ls -1 ${backup_dir} |sort | awk '/etc-dnsmasq-backup.[0-9]+.tgz/ {fname=$1} END {print fname}'`
+saved_inf=`ls -1 ${backup_dir} |sort | awk '/interfaces.[0-9]+/ {fname=$1} END {print fname}'`
+saved_resolv=`ls -1 ${backup_dir} |sort | awk '/resolv.conf.[0-9]+/ {fname=$1} END {print fname}'`
+saved_iptables=`ls -1 ${backup_dir} |sort | awk '/iptables.[0-9]+/ {fname=$1} END {print fname}'`
+saved_ifplugd=`ls -1 ${backup_dir} |sort | awk '/ifplugd.[0-9]+/ {fname=$1} END {print fname}'`
+saved_hostname=`ls -1 ${backup_dir} |sort | awk '/hostname.[0-9]+/ {fname=$1} END {print fname}'`
+saved_hosts=`ls -1 ${backup_dir} |sort | awk '/hosts.[0-9]+/ {fname=$1} END {print fname}'`
+
+else
+# if backup version is specified explicitly
+saved_ssh="etc-ssh-backup.${date_backup}.tgz"
+saved_ovpn="etc-ovpn-backup.${date_backup}.tgz"
+saved_ppp="etc-ppp-backup.${date_backup}.tgz"
+saved_dns="etc-dnsmasq-backup.${date_backup}.tgz"
+saved_inf="interfaces.${date_backup}"
+saved_resolv="resolv.conf.${date_backup}"
+saved_iptables="iptables.${date_backup}"
+saved_ifplugd="ifplugd.${date_backup}"
+saved_hostname="hostname.${date_backup}"
+saved_hosts="hosts.${date_backup}"
+
+fi
+
+
+#sshd
+chroot ${dest_dir} /bin/tar xz -C / -f /root/backup/${saved_ssh}
+#ovpn
+chroot ${dest_dir} /bin/tar xz -C / -f /root/backup/${saved_ovpn}
+# ppp
+chroot ${dest_dir} /bin/tar xz -C / -f /root/backup/${saved_ppp}
+# dns
+chroot ${dest_dir} /bin/tar xz -C / -f /root/backup/${saved_dns}
+
+
+#interfaces
+chroot ${dest_dir} cp /root/backup/interfaces /etc/network/
+
+chroot ${dest_dir} cp /root/backup/resolv.conf /etc/
+
+chroot ${dest_dir} cp /root/backup/iptables /etc/network/
+
+chroot ${dest_dir} cp /root/backup/ifplugd /etc/network/
+
+chroot ${dest_dir} cp /root/backup/hostname /etc/
+
+chroot ${dest_dir} cp /root/backup/hosts /etc/
+
+# mac addresses (this file has only one version)
+#cp ${backup_dir}/mactab ${dest_dir}/etc/mactab
+#cp ${backup_dir}/mactab1 ${dest_dir}/etc/mactab1
+
+#cat << EON >${backup_dir}/nameif
+##!/bin/sh
+#PATH=/sbin
+#nameif -c /etc/mactab1
+#nameif -c /etc/mactab
+#EON
+#chroot ${dest_dir} cp /root/backup/nameif /etc/network/if-pre-up.d/
+#chroot ${dest_dir} chmod +x /etc/network/if-pre-up.d/nameif
+
+# udev way of static eth names
+cp ${backup_dir}/70-persistent-net.rules ${dest_dir}/etc/udev/rules.d/70-persistent-net.rules
+
+}
+####################################
+patch_configs()
+{
+echo TODO patch config
+chroot $1 useradd -m wadmin
+chroot $1 echo wadmin:wildix | chroot $1 chpasswd
+}
+####################################
+#  (mv old; cp new)
+set_fstab()
+{
+mv $1/etc/fstab $1/etc/fstab.old
+cat << FSTAB > $1/etc/fstab
+${raw_ssd8}1 /boot           ext2    rw,discard,noatime,noauto,nodiratime,sync 0       1
+${raw_ssd8}5 /               ext4    ro,discard,noatime,nodiratime,errors=remount-ro,data=writeback 0       1
+${raw_ssd8}6 /rw2            ext4    rw,noatime,nodiratime,sync   		      			 0       2
+FSTAB
+}
+############################################
+# returns the system to default state
+# if $1 = 1 then also delete ext4 kernel
+# 1 - remove ${raw_ssd}4 partition
+# 2 - unmount everything
+# 3 - restore menu.lst from backup
+revert_state()
+{
+# check if all ssd unmounted
+# Need to run twice to be sure, if we did recursive mount
+mount | grep -w -E "${raw_ssd}6" | awk '{print $1}' | xargs -I {} umount -f {}
+mount | grep -w -E "${raw_ssd}5" | awk '{print $1}' | xargs -I {} umount -f {}
+
+# remove 4th part
+echo destroying 4th partition on SSD
+#echo -e "d\n4\nw\n" | fdisk ${raw_ssd}
+parted -s ${raw_ssd} rm 6 rm 5 rm 4
+partprobe ${raw_ssd}
+
+# restore old menu.lst
+if [ -f ${boot_dir}/grub/menu.lst2.backup ]
+then
+cp ${boot_dir}/grub/menu.lst2.backup ${boot_dir}/grub/menu.lst
+rm /boot/vmlinuz-3.* /boot/initrd.img-3.* /boot/System.map-3.*
+fi
+
+if [ "x$1" = "x1" ]
+then
+if [ -f ${boot_dir}/grub/menu.lst.backup ]
+then
+cp ${boot_dir}/grub/menu.lst.backup ${boot_dir}/grub/menu.lst
+rm /boot/vmlinuz-2.*ext4
+fi # have menu backup
+fi # do revert to 1st state - before ext4 kernel installed
+exit
+}
+###################################################################################### main
+
+mount_boot
+
+if [ "x$1" = "x-r" ]
+then
+shift
+if [ "x$1" = "x-b" ]
+then
+revert_state 1
+else
+revert_state
+fi
+fi
+if [ "x$1" = "x-k" ]
+then
+install_deb5_kernel_ext4 ${boot_dir}
+set_ext4_boot
+fi
+chk_boot_size
+chk_free_ssd
+create_new_part /home/admin/deb8_inst
+populate_deb8_fs /home/admin/deb8_inst
+copy_deb8_kern /home/admin/deb8_inst/newboot
+backup_etc_net  /home/admin/deb8_inst/root/backup
+restore_net_conf_chroot /home/admin/deb8_inst/root/backup /home/admin/deb8_inst
+patch_configs /home/admin/deb8_inst
+set_fstab /home/admin/deb8_inst
+set_deb8_boot

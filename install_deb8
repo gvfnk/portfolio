@@ -1,0 +1,777 @@
+#!/bin/sh
+# set -e # stop on errors
+set -x # debug
+
+# if = 1 then full dump restore of old rw2 partition on newly built FS or just network config only (default)
+#full_rw2_dump=1
+
+# required size for new install (MB)
+required_part_size=1250
+new_kern_ver="3.16.7"
+
+# this is dd image of new deb8 system -- !!! -- raw device /dev/sda
+deb8wildixnew_img="/root/deb8_my_raw-generated.img"
+#deb8wildixnew_img="/root/deb8wildix231215.img"
+
+# partition where main system lays when mounted as a loop dev
+deb8_sys_part="p1"
+# partition where rw2 lays when mounted as a loop dev
+deb8_rw2_part="p5"
+# unix_time_sec() - set for version control
+cur_date=`date "+%s"`
+# SSD device name
+raw_ssd="/dev/sda"
+# filename to store backup of SSD !!! - raw device
+backup_raw_file="/root/backup-sda-raw.img.gz"
+# filename to store rw2 partition -- specially not compressed for further work
+backup_raw_file_rw="/root/backup-sda3-part.img"
+
+error_log="/root/error.log"
+# file log, where will be stored all variables showing the upgrade steps
+cmd_log="/root/command.log"
+# directory where new kernel and initrd is stored -- these files will be copied to /boot partition
+new_boot_files="/root/new_boot"
+# FS label which will be set on newly created partition
+deb8label=deb8wildix
+# read vars from log
+#source ./${cmd_log}
+# zeroing the log
+echo cur_date=${cur_date} > ${cmd_log}
+echo  "================ ${cur_date} New start of script $@" >> ${error_log}
+
+##################################################################### subs
+# backup current raw FS on flash disk
+backup_raw()
+{
+#if [ "x$raw_backup_done" = "x1" -a -f $backup_raw_file ]
+if [ -f $backup_raw_file ]
+then
+# do not do a lot of backups
+raw_backup_done=1
+echo we already backuped
+else
+echo !!! We are going to backup your system disk on flash grive. This process will take about 15-35 minutes depending on your system''s CPU, flash write speed, and so on
+echo Please be patient
+# store full dd image and compress it
+dd if=$raw_ssd bs=4M conv=notrunc | gzip > ${backup_raw_file} && echo raw_backup_done=1 >> $cmd_log && raw_backup_done=1
+# store rw (sda3) image for further work (uncompressed)
+dd if=${raw_ssd}3 bs=4M conv=notrunc of=${backup_raw_file_rw} && echo raw_backup3_done=1 >> $cmd_log && raw_backup3_done=1
+fi
+
+if [ "x$raw_backup_done" = "x1" -a -f $backup_raw_file ]
+then
+echo Backup process succeeded!!
+else
+echo Something goes wrong!! Cant do raw backup!!
+echo Something goes wrong!! Cant do raw backup!! >> ${error_log}
+exit 1
+fi
+}
+##############################
+# mount boot partition and compare its size with new kernel and initrd image
+chk_boot()
+{
+# TODO: if mount unsuccessful run fsck on this dev
+mount ${raw_ssd}1 /mnt/1
+boot_part_free_size_k=`df -k /mnt/1 | awk '/dev/ {print $4}' `
+new_kern_size_k=`du -sk /mnt/1/*${new_kern_ver}* | awk '{sum=sum+$1} END {print sum}'`
+new_boot_size_k=`du -sk ${new_boot_files} | awk '{print $1}'`
+boot_free_all=`expr $boot_part_free_size_k + $new_kern_size_k + 12`
+if [ $boot_free_all -lt $new_boot_size_k ]
+then
+echo small_boot=1 >> $cmd_log
+echo Boot partition size is too small to for new kernel
+echo We have $boot_free_all kbytes but need $new_boot_size kbytes
+echo Cant install new system along with old one. The new system will overwrite the old one.
+echo var_b=1 >> $cmd_log
+export var_b=1
+else
+echo var_a1=1 >> $cmd_log
+export var_a1=1
+fi
+umount /mnt/1
+}
+
+#################################
+# check 3 conditions for var_a install
+# 1. Boot size is OK to store new kernel and initrd
+# 2. partitions less then 4
+# 3. SSD size bigger then requiered
+
+chk_free_ssd()
+{
+# number of partitions
+parts_cnt=`fdisk -l ${raw_ssd} | grep -E "^${raw_ssd}" | wc -l`
+if [ $parts_cnt -gt 3 ]
+then
+echo var_b=1 >> $cmd_log
+export var_b=1
+echo You have $parts_cnt partitions on your SSD, which is more then 3,
+echo Cant install new system along with old one. The new system will overwrite the old one.
+echo var_b=1 >> $cmd_log
+export var_b=1
+else # partitions less then 4, its OK for var "a" install
+echo var_a2=1 >> $cmd_log
+export var_a2=1
+
+# check free space on SSD
+free_ssd_m=`parted ${raw_ssd} unit B print free | awk '/Free Space/ {print int($3/1024/1024)}' | tail -n 1` && echo free_ssd_m=$free_ssd_m >> ${cmd_log}
+if [ $free_ssd_m -lt $required_part_size ]
+then
+echo You have $free_ssd_m MBytes free on SSD which is smaller then required $required_part_size MBytes,
+echo Cant install new system along with old one. The new system will overwrite the old one.
+echo var_b=1 >> $cmd_log
+export var_b=1
+else # ssd space is enough
+echo var_a3=1 >> $cmd_log
+export var_a3=1
+if [ "x$var_a1" = "x1" ]
+then
+echo All requierements for Var A OK
+echo var_a=1 >> $cmd_log
+export var_a=1
+fi # var_a1
+fi # free_ssd_m
+
+fi # parts_cnt
+
+}
+####################################
+# Create 4th partition and ext4 FS on it labeled 'deb8wildix'
+# then mount it on /mnt/4
+
+create_new_part()
+{
+# creating new part with fdisk requieres unmounting everything on this device
+# echo -e  "n\np\n\n\nw\nq\n" | fdisk ${raw_ssd} && part4_created=1 && echo part4_created=1 >> ${cmd_log}
+
+# create new with parted
+# starting point of new  part
+start_mb=`parted -s ${raw_ssd} unit MB print free | awk '/Free Space/ {print $1}' | tail -n 1`
+if [ "$start_mb" = "0.00MB" ]
+then
+echo no free space on device ${raw_ssd}
+echo no free space on device ${raw_ssd} >> ${error_log}
+exit 1
+fi
+parted -s ${raw_ssd} mkpart primary ext4 ${start_mb} 100%
+partprobe ${raw_ssd}
+mkfs.ext4 -L ${deb8label} -q -F ${raw_ssd}4 && fs4_created=1 && echo fs4_created=1 >> ${cmd_log}
+mount ${raw_ssd}4 /mnt/4 && part4_mounted=1 && echo part4_mounted=1 >> ${cmd_log}
+
+is_mnt_pnt=`mount | grep -w "/mnt/4"`
+if [ -z "${is_mnt_pnt}" ]
+then
+echo ${raw_ssd}4 file system not mounted
+echo ${raw_ssd}4 file system not mounted >> ${error_log}
+exit 1 
+fi
+
+# last check the size of newly created partition
+real_size_m=`df -m /mnt/4 | awk '/dev/ {print $4}'`
+
+if [ $real_size_m -lt $required_part_size ]
+then
+echo You have $real_size_m MBytes free on ${raw_ssd}4 partition of SSD which is smaller then required $required_part_size MBytes,
+echo Cant install new system along with old one. The new system will overwrite the old one.
+echo var_b=1 >> $cmd_log
+export var_b=1
+else # ssd space is enough
+echo var_a4=1 >> $cmd_log
+export var_a4=1
+fi # real_size
+
+}
+#########################################
+# copy new deb8 system to newly created partition
+#
+dumprestore_sys_fs()
+{
+# unmount and destroy loop if they were created
+umount /mnt/deb8
+losetup -d /dev/loop0
+
+if [ -f ${deb8wildixnew_img} ]
+then
+losetup /dev/loop0 ${deb8wildixnew_img}
+partprobe /dev/loop0
+mkdir -p /mnt/deb8
+mount /dev/loop0${deb8_sys_part} /mnt/deb8 && deb8_mount=1 && echo deb8_mount=1  >> ${cmd_log}
+else
+echo Live image FS for deb8 = ${deb8wildixnew_img} not found
+echo Live image FS for deb8 = ${deb8wildixnew_img} not found >> ${error_log}
+exit 1
+fi # deb8 image \not found
+
+if [ "x${deb8_mount}" = "x1" ]
+then
+
+# check if this a mount point or not
+is_mnt_pnt=`mount | grep -w "/mnt/4"`
+if [ -z "${is_mnt_pnt}" ]
+then
+echo ${raw_ssd}4 file system not mounted
+echo ${raw_ssd}4 file system not mounted >> ${error_log}
+exit 1 
+fi # new part 4 mounted
+
+# go to dir where new ssd part mounted
+cd /mnt/4
+dump -0 -f - /dev/loop0${deb8_sys_part} | restore -r -f - && restore_sys=1 && echo restore_sys=1  >> ${cmd_log}
+umount /dev/loop0${deb8_sys_part}
+else
+echo Error in mounting deb8 sys partition ${deb8wildixnew_img} ==== /dev/loop0${deb8_sys_part}
+echo Error in mounting deb8 sys partition ${deb8wildixnew_img} ==== /dev/loop0${deb8_sys_part} >> ${error_log}
+exit 1
+fi # mount success
+
+}
+#########################################
+# copy new deb8 system to newly created partition
+# $1 - 
+#
+dumprestore_rw2_fs()
+{
+
+# this also means that we using image created by wildix, partitioned for root and rw2 
+# then copy a fstab file for this
+cp ${new_boot_files}/fstab /mnt/4/etc/fstab
+# TODO: rw2 dump restore
+mkdir -p /mnt/4/rw2
+mount ${raw_ssd}3 /mnt/4/rw2 && deb5rw2_mount=1 && echo deb5rw2_mount=1  >> ${cmd_log}
+
+mkdir -p /mnt/deb8rw2
+mount /dev/loop0${deb8_rw2_part} /mnt/deb8rw2 && deb8rw2_mount=1 && echo deb8rw2_mount=1  >> ${cmd_log}
+
+if [ "x${deb8rw2_mount}" = "x1" -a "x${deb5rw2_mount}" = "x1" ]
+then
+# go to dir where new ssd part mounted
+
+#cd /mnt/4/rw2
+#dump -0 -f - /dev/loop0${deb8_rw2_part} | restore -r -f - && restore_rw2=1 && echo restore_rw2=1  >> ${cmd_log}
+
+# overwrite contents of rw2 partition
+cp -a /mnt/deb8rw2/* /mnt/4/rw2/ && restore_rw2=1 && echo restore_rw2=1  >> ${cmd_log}
+
+umount /dev/loop0${deb8_rw2_part}
+else
+echo Error in mounting rw2 partition
+echo Error in mounting rw2 partition >> ${error_log}
+echo "deb8 rw2 mounted= ${deb8rw2_mount} OR\\AND deb5 rw2 mounted= ${deb5w2_mount}"
+echo "deb8 rw2 mounted= ${deb8rw2_mount} OR\\AND deb5 rw2 mounted= ${deb5w2_mount}" >> ${error_log}
+exit 1
+fi # mount rw2 success
+}
+##########################################
+# restore net configs
+# $1 - where backup is 
+# $2 - destination dir, where new partition is mounted
+# $3 - if set - then we will restore not a last done backup, but the one is specified by unix_time_sec()
+restore_net_conf()
+{
+# 
+backup_dir=$1
+dest_dir=$2
+date_backup=$3
+
+is_mnt_pnt=`mount | grep -w "${dest_dir}"`
+if [ -z "${is_mnt_pnt}" ]
+then
+echo $dest_dir file system not mounted
+echo $dest_dir file system not mounted >> ${error_log}
+exit 1 
+fi
+
+# enable forwarding
+echo 1 > /proc/sys/net/ipv4/ip_forward
+echo "net.ipv4.ip_forward = 1" >> ${dest_dir}/etc/sysctl.conf
+
+if [ "x$date_backup" = "x" ]
+then
+# last saved backup
+saved_ssh=${backup_dir}/`ls -1 ${backup_dir} |sort | awk '/etc-ssh-backup.[0-9]+.tgz/ {fname=$1} END {print fname}'`
+saved_ovpn=${backup_dir}/`ls -1 ${backup_dir} |sort | awk '/etc-ovpn-backup.[0-9]+.tgz/ {fname=$1} END {print fname}'`
+saved_ppp=${backup_dir}/`ls -1 ${backup_dir} |sort | awk '/etc-ppp-backup.[0-9]+.tgz/ {fname=$1} END {print fname}'`
+saved_dns=${backup_dir}/`ls -1 ${backup_dir} |sort | awk '/etc-dnsmasq-backup.[0-9]+.tgz/ {fname=$1} END {print fname}'`
+saved_inf=${backup_dir}/`ls -1 ${backup_dir} |sort | awk '/interfaces.[0-9]+/ {fname=$1} END {print fname}'`
+saved_resolv=${backup_dir}/`ls -1 ${backup_dir} |sort | awk '/resolv.conf.[0-9]+/ {fname=$1} END {print fname}'`
+saved_iptables=${backup_dir}/`ls -1 ${backup_dir} |sort | awk '/iptables.[0-9]+/ {fname=$1} END {print fname}'`
+saved_ifplugd=${backup_dir}/`ls -1 ${backup_dir} |sort | awk '/ifplugd.[0-9]+/ {fname=$1} END {print fname}'`
+saved_hostname=${backup_dir}/`ls -1 ${backup_dir} |sort | awk '/hostname.[0-9]+/ {fname=$1} END {print fname}'`
+saved_hosts=${backup_dir}/`ls -1 ${backup_dir} |sort | awk '/hosts.[0-9]+/ {fname=$1} END {print fname}'`
+
+else
+# if backup version is specified explicitly
+saved_ssh="${backup_dir}/etc-ssh-backup.${date_backup}.tgz"
+saved_ovpn="${backup_dir}/etc-ovpn-backup.${date_backup}.tgz"
+saved_ppp="${backup_dir}/etc-ppp-backup.${date_backup}.tgz"
+saved_dns="${backup_dir}/etc-dnsmasq-backup.${date_backup}.tgz"
+saved_inf="${backup_dir}/interfaces.${date_backup}"
+saved_resolv="${backup_dir}/resolv.conf.${date_backup}"
+saved_iptables="${backup_dir}/iptables.${date_backup}"
+saved_ifplugd="${backup_dir}/ifplugd.${date_backup}"
+saved_hostname="${backup_dir}/hostname.${date_backup}"
+saved_hosts="${backup_dir}/hosts.${date_backup}"
+
+fi
+
+#sshd
+tar xzv -C ${dest_dir} -f ${saved_ssh}
+tar xzv -C ${dest_dir} -f ${saved_ovpn}
+tar xzv -C ${dest_dir} -f ${saved_ppp}
+tar xzv -C ${dest_dir} -f ${saved_dns}
+
+#interfaces
+cp ${saved_inf} ${dest_dir}/etc/network/interfaces
+cp ${saved_resolv} ${dest_dir}/etc/resolv.conf
+
+#iptables ifplugd
+cp ${saved_iptables} ${dest_dir}/etc/network/iptables
+cp ${saved_ifplugd} ${dest_dir}/etc/network/ifplugd
+
+cp ${saved_hostname} ${dest_dir}/etc/hostname
+cp ${saved_hosts} ${dest_dir}/etc/hosts
+
+# TODO: fstab check
+
+# mac addresses (this file has only one version)
+cp ${backup_dir}/mactab ${dest_dir}/etc/mactab
+
+cat << EON >${dest_dir}/etc/network/if-pre-up.d/nameif
+#!/bin/sh
+PATH=/sbin
+nameif -c /etc/mactab
+EON
+
+chmod +x ${dest_dir}/etc/network/if-pre-up.d/nameif
+
+}
+##########################################
+# restore net configs chrooted
+# $1 - where backup is 
+# $2 - destination dir, where new partition is mounted
+# $3 - if set - then we will restore not a last done backup, but the one is specified by unix_time_sec()
+restore_net_conf_chroot()
+{
+# 
+backup_dir=$1
+dest_dir=$2
+date_backup=$3
+
+is_mnt_pnt=`mount | grep -w "${dest_dir}"`
+if [ -z "${is_mnt_pnt}" ]
+then
+echo $dest_dir file system not mounted chroot
+echo $dest_dir file system not mounted chroot >> ${error_log}
+exit 1 
+fi
+
+# enable forwarding
+echo 1 > /proc/sys/net/ipv4/ip_forward
+echo "net.ipv4.ip_forward = 1" >> ${dest_dir}/etc/sysctl.conf
+
+if [ "x$date_backup" = "x" ]
+then
+# last saved backup
+saved_ssh=`ls -1 ${backup_dir} |sort | awk '/etc-ssh-backup.[0-9]+.tgz/ {fname=$1} END {print fname}'`
+saved_ovpn=`ls -1 ${backup_dir} |sort | awk '/etc-ovpn-backup.[0-9]+.tgz/ {fname=$1} END {print fname}'`
+saved_ppp=`ls -1 ${backup_dir} |sort | awk '/etc-ppp-backup.[0-9]+.tgz/ {fname=$1} END {print fname}'`
+saved_dns=`ls -1 ${backup_dir} |sort | awk '/etc-dnsmasq-backup.[0-9]+.tgz/ {fname=$1} END {print fname}'`
+saved_inf=`ls -1 ${backup_dir} |sort | awk '/interfaces.[0-9]+/ {fname=$1} END {print fname}'`
+saved_resolv=`ls -1 ${backup_dir} |sort | awk '/resolv.conf.[0-9]+/ {fname=$1} END {print fname}'`
+saved_iptables=`ls -1 ${backup_dir} |sort | awk '/iptables.[0-9]+/ {fname=$1} END {print fname}'`
+saved_ifplugd=`ls -1 ${backup_dir} |sort | awk '/ifplugd.[0-9]+/ {fname=$1} END {print fname}'`
+saved_hostname=`ls -1 ${backup_dir} |sort | awk '/hostname.[0-9]+/ {fname=$1} END {print fname}'`
+saved_hosts=`ls -1 ${backup_dir} |sort | awk '/hosts.[0-9]+/ {fname=$1} END {print fname}'`
+
+else
+# if backup version is specified explicitly
+saved_ssh="etc-ssh-backup.${date_backup}.tgz"
+saved_ovpn="etc-ovpn-backup.${date_backup}.tgz"
+saved_ppp="etc-ppp-backup.${date_backup}.tgz"
+saved_dns="etc-dnsmasq-backup.${date_backup}.tgz"
+saved_inf="interfaces.${date_backup}"
+saved_resolv="resolv.conf.${date_backup}"
+saved_iptables="iptables.${date_backup}"
+saved_ifplugd="ifplugd.${date_backup}"
+saved_hostname="hostname.${date_backup}"
+saved_hosts="hosts.${date_backup}"
+
+fi
+
+
+# chrooted restore for etc files in order to take into account symlinks to rw2
+mkdir -p ${dest_dir}/ro/root/backup
+cp  ${backup_dir}/${saved_ssh} ${dest_dir}/ro/root/backup
+cp  ${backup_dir}/${saved_ovpn} ${dest_dir}/ro/root/backup
+cp  ${backup_dir}/${saved_ppp} ${dest_dir}/ro/root/backup
+cp  ${backup_dir}/${saved_dns} ${dest_dir}/ro/root/backup
+
+#sshd
+chroot ${dest_dir} /bin/tar xzv -C / -f /ro/root/backup/${saved_ssh}
+#ovpn
+chroot ${dest_dir} /bin/tar xzv -C / -f /ro/root/backup/${saved_ovpn}
+# ppp
+chroot ${dest_dir} /bin/tar xzv -C / -f /ro/root/backup/${saved_ppp}
+# dns
+chroot ${dest_dir} /bin/tar xzv -C / -f /ro/root/backup/${saved_dns}
+
+
+#interfaces
+cp ${backup_dir}/${saved_inf} ${dest_dir}/ro/root/backup/interfaces
+chroot ${dest_dir} cp /ro/root/backup/interfaces /etc/network/
+
+cp ${backup_dir}/${saved_resolv} ${dest_dir}/ro/root/backup/resolv.conf
+chroot ${dest_dir} cp /ro/root/backup/resolv.conf /etc/
+
+#iptables ifplugd
+cp ${backup_dir}/${saved_iptables} ${dest_dir}/ro/root/backup/iptables
+chroot ${dest_dir} cp /ro/root/backup/iptables /etc/network/
+
+cp ${backup_dir}/${saved_ifplugd} ${dest_dir}/ro/root/backup/ifplugd
+chroot ${dest_dir} cp /ro/root/backup/ifplugd /etc/network/
+
+cp ${backup_dir}/${saved_hostname} ${dest_dir}/ro/root/backup/hostname
+chroot ${dest_dir} cp /ro/root/backup/hostname /etc/
+
+cp ${backup_dir}/${saved_hosts} ${dest_dir}/ro/root/backup/hosts
+chroot ${dest_dir} cp /ro/root/backup/hosts /etc/
+
+# end of chroot backup
+
+# TODO: fstab check
+
+# mac addresses (this file has only one version)
+cp ${backup_dir}/mactab ${dest_dir}/etc/mactab
+
+cat << EON >${dest_dir}/rw2/etc/network/if-pre-up.d/nameif
+#!/bin/sh
+PATH=/sbin
+nameif -c /etc/mactab
+EON
+chmod +x ${dest_dir}/rw2/etc/network/if-pre-up.d/nameif
+}
+############################################
+# copy new deb8 kernel and initrd to /boot partition
+cp_deb8_kern()
+{
+have_boot_mnt=`mount | grep ${raw_ssd}1 | awk '{print $3}'`
+if [ "x$have_boot_mnt" = "x" ]
+then
+echo boot not mounted
+fsck -y ${raw_ssd}1
+mount ${raw_ssd}1 /mnt/1
+fi
+
+# if we have the same boot files as those on flash - remove them from /mnt/1/boot
+# we have not much space for multiple boot files!!!
+kern_file=`ls -1 /boot | awk '/vmlinuz/ {fname=$1} END {print fname}'`
+initrd_file=`ls -1 /boot | awk '/initrd.img/ {fname=$1} END {print fname}'`
+
+if [ -f /mnt/1/boot/${kern_file} ]
+then
+rm /mnt/1/boot/${kern_file}
+fi
+if [ -f /mnt/1/boot/${initrd_file} ]
+then
+rm /mnt/1/boot/${initrd_file}
+fi
+
+
+# if upgrade variant_a then
+if [ "x$var_a" = "x1" ]
+then
+cp ${new_boot_files}/* /mnt/1/ && kern_copied=1 && echo kern_copied=1  >> ${cmd_log}
+fi
+}
+##########################################
+# add/change strings in menu.lst to set boot from flash drive with deb8livroot label by default
+# or fall back to 0 (first line of menu)
+set_deb8_boot()
+{
+#set -x
+cat ${backup_dir}/menu.lst2.default | grep -v -E "^default|^fallback" >${backup_dir}/menu.lst-tmp
+# set filenames for kernel and initrd aftre files stored in $new_boot_files
+kern_file=`ls -1 ${new_boot_files} | awk '/vmlinuz/ {fname=$1} END {print fname}'`
+initrd_file=`ls -1 ${new_boot_files} | awk '/initrd.img/ {fname=$1} END {print fname}'`
+
+# add link to boot new kernel and root from usb flash
+cat <<EOC >>  ${backup_dir}/menu.lst-tmp
+
+title deb8
+root (hd0,0)
+kernel /${kern_file} root=/dev/disk/by-label/${deb8label} rw console=ttyS0,19200 panic=1
+initrd /${initrd_file}
+boot
+EOC
+
+# set default boot
+def_title=`cat  ${backup_dir}/menu.lst-tmp | awk ' /^title/ {count=count+1} /^title deb8/ {set_def= count-1} END {print set_def }'`
+
+awk_c="cat  ${backup_dir}/menu.lst2.default | awk ' /^default/ {prev_def=\$2} /^fallback/ {print prev_def, \$2, \$3, \$4}'"
+prev_title=`eval $awk_c`
+
+echo default $def_title  > ${backup_dir}/menu.lst-new
+echo fallback $prev_title  >>${backup_dir}/menu.lst-new
+#echo "# previous_default=$prev_title" >>${backup_dir}/menu.lst-new
+echo "" >>${backup_dir}/menu.lst-new
+cat ${backup_dir}/menu.lst-tmp  >>${backup_dir}/menu.lst-new
+
+# alternative way to rewrite menu.lst
+#eval "cat  ${boot_dir}/grub/menu.lst | grep -v -E "^fallback" | sed -e 's/^default.*$/default $def_title\\nfallback 0\\n/'" >${backup_dir}/menu.lst-new
+
+cp ${backup_dir}/menu.lst-new ${boot_dir}/grub/menu.lst
+
+}
+#########################################
+# check if we have menu.lst 
+# and copy it to backup_dir ( with another filename if it is not a first run of this script )
+# vars set not_grub1 grub1_menu_backed
+# $1 -- dir where /boot mounted
+backup_menu2()
+{
+boot_dir=$1
+
+if [ -f ${boot_dir}/grub/menu.lst ]
+then
+# we have grub1 menu config. Great!
+#backup all changed files
+
+if [ -f "${backup_dir}/menu.lst2.default" ]
+then
+#not a first run of the init script
+cp ${boot_dir}/grub/menu.lst ${backup_dir}/menu.lst2.${cur_date} && grub1_menu_backed2=1 && echo grub1_menu_backed2=1 >> ${cmd_log}
+else
+cp ${boot_dir}/grub/menu.lst ${backup_dir}/menu.lst2.default && grub1_menu_backed2=1 && echo grub1_menu_backed2=1 >> ${cmd_log}
+fi
+
+if [ "x$grub1_menu_backed2" = "x" ]
+then
+echo  !!!!!!!!!! smth goes wrong!! cant save menu.lst to ${backup_dir}
+echo  !!!!!!!!!! smth goes wrong!! cant save menu.lst to ${backup_dir} >> ${error_log}
+exit
+fi
+
+else
+# we dont see menu.lst
+not_grub1=1
+echo  !!!!!!!!!! have not grub1 installed !!!!!!!!!!!!!
+echo  !!!!!!!!!! have not grub1 installed !!!!!!!!!!!!! >> ${error_log}
+fi # have menu.lst fi
+}
+###########################################
+# var_b install -- if SSD size not enough for new partition creation
+# check if backup exists and ask a question
+# dd new image to raw device
+# mount root ( to /mnt/deb8 ) and rw2 ( to /mnt/deb8/rw2 ) partitions for config restoring
+dd_new_fs()
+{
+
+if [ ! -f $backup_raw_file ]
+then
+echo "Backup image not found. Are you sure you want to copy new image to SSD? (yes/N)"
+read ans
+if [ "x$ans" != "xyes" ]
+then
+exit 1
+fi # I'm sure
+fi # no backup
+
+# check if all ssd unmounted
+mount | grep -w -E "${raw_ssd}." | awk '{print $1}' | xargs -I {} umount -f {}
+
+# check if all loop unmounted
+mount | grep -w -E "/dev/loop.*" | awk '{print $1}' | xargs -I {} umount -f {}
+
+echo !!!!!!!!!  We are going to dd new SSD image !!!!! 
+echo !!!!!!!!!  We are going to dd new SSD image !!!!!  >> ${error_log}
+
+echo Do NOT power off your system, otherise you will need console cable to change boot source to flash drive!!!
+
+if [ -f ${deb8wildixnew_img} ]
+then
+dd if=${deb8wildixnew_img} of=${raw_ssd} bs=4M conv=notrunc && deb8new_dded=1 && echo deb8new_dded=1 >> ${cmd_log}
+fi
+
+partprobe ${raw_ssd}
+
+mkdir -p /mnt/deb8
+mount ${raw_ssd}1 /mnt/deb8 && mount ${raw_ssd}5 /mnt/deb8/rw2 && newdeb8_mounted=1 && echo  newdeb8_mounted=1 >> ${cmd_log}
+
+if [ "x$newdeb8_mounted" = "x" ]
+then
+echo Error !!! Cant mount newly copied FS. Restoring backuped image !!!!! This will take 15-25 minutes
+echo Error !!! Cant mount newly copied FS. Restoring backuped image !!!!! This will take 15-25 minutes >> ${error_log}
+if [ -f $backup_raw_file ]
+then
+gzip -dc ${backup_raw_file} | dd of=${raw_ssd} bs=4M conv=notrunc && oldimg_restored=1 && echo oldimg_restored=1 >> ${cmd_log}
+partprobe ${raw_ssd}
+else
+echo Backuped image not found !!!
+echo Backuped image not found !!! >> ${error_log}
+fi # restore if backup exists
+
+fi # new deb8 not mounted
+
+}
+#############################################
+# Just dd old backuped image to raw device
+dd_old_img()
+{
+# check if all ssd unmounted
+mount | grep -w -E "${raw_ssd}." | awk '{print $1}' | xargs -I {} umount -f {}
+mount | grep -w -E "${raw_ssd}." | awk '{print $1}' | xargs -I {} umount -f {}
+
+if [ -f $backup_raw_file ]
+then
+echo !!!!!!!!!  We are going to dd old image to SSD !!!!! This will take 15-25 minutes
+echo !!!!!!!!!  We are going to dd old image to SSD !!!!! This will take 15-25 minutes >> ${error_log}
+echo Do NOT power off your system, otherise you will need console cable to change boot source to flash drive!!!
+
+gzip -dc ${backup_raw_file} | dd of=${raw_ssd} bs=4M conv=notrunc && oldimg_restored=1 && echo oldimg_restored=1 >> ${cmd_log}
+partprobe ${raw_ssd}
+
+else
+echo Backuped image not found !!!
+echo Backuped image not found !!! >> ${error_log}
+fi # restore if backup exists
+
+}
+
+
+############################################
+# returns the system to default state
+# 1 - remove /dev/sda4 partition
+# 2 - unmount everything
+# 3 - restore rw2 partition from backuped image if it is
+restore_def()
+{
+backup_dir=/root/backup
+# check if all ssd unmounted
+# Need to run twice to be sure, if we did recursive mount
+mount | grep -w -E "${raw_ssd}." | awk '{print $1}' | xargs -I {} umount -f {}
+mount | grep -w -E "${raw_ssd}." | awk '{print $1}' | xargs -I {} umount -f {}
+
+# remove 4th part
+echo destroying 4th partition on SSD
+#echo -e "d\n4\nw\n" | fdisk ${raw_ssd}
+parted -s ${raw_ssd} rm 4
+partprobe ${raw_ssd}
+
+# restore old menu.lst
+if [ -f ${backup_dir}/menu.lst2.default ]
+then
+mount ${raw_ssd}1 /mnt/1
+cp ${backup_dir}/menu.lst2.default /mnt/1/grub/menu.lst
+fi
+
+# unmount and destroy loop if they were created
+# check if all loop unmounted 
+# Need to run twice to be sure, if we did recursive mount
+mount | grep -w -E "/dev/loop.*" | awk '{print $1}' | xargs -I {} umount -f {}
+mount | grep -w -E "/dev/loop.*" | awk '{print $1}' | xargs -I {} umount -f {}
+losetup -d /dev/loop0
+losetup -d /dev/loop1
+
+# restore rw2 partition
+if [ -f ${backup_raw_file_rw} ]
+then
+dd if=${backup_raw_file_rw} of=${raw_ssd}3 bs=4M conv=notrunc && restored_rw2=1 && echo restored_rw2=1  >> ${cmd_log}
+else
+echo  ${backup_raw_file_rw} not found
+echo  ${backup_raw_file_rw} not found >> ${error_log}
+exit 1
+fi
+}
+############################################
+# dump\restore rw2 partition contents to newly created\dd-ed part from backuped image
+# 1 - dest_dir where new rw2 partition is mounted
+restore_rw2_dump()
+{
+new_deb8_mnt=$1
+# restore rw2 partition
+if [ -f ${backup_raw_file_rw} ]
+then
+mkdir -p /mnt/deb5rw2
+losetup /dev/loop1 ${backup_raw_file_rw} && loop1_set_rw2=1 && echo  loop1_set_rw2=1 >> ${cmd_log}
+mount /dev/loop1 /mnt/deb5rw2
+#cd $new_deb8_mnt
+
+if [ "x$loop1_set_rw2" = "x1" ]
+then
+#dump -0 -f - /dev/loop1 | restore -r -f - && dumprw2_ok=1 && echo  dumprw2_ok=1 >> ${cmd_log}
+cp -a /mnt/deb5rw2  ${new_deb8_mnt}
+fi # loop1 set success
+else
+echo  ${backup_raw_file_rw} not found rw2_dump
+echo  ${backup_raw_file_rw} not found rw2_dump >> ${error_log}
+exit 1
+fi
+}
+################################################################## main
+
+if [ "x$1" = "x-r" ]
+then
+restore_def
+exit
+fi
+
+if [ "x$1" = "x-d" ]
+then
+dd_old_img
+exit
+fi
+
+backup_raw
+chk_boot
+if [ "x$var_a1" = "x1" ]
+then
+chk_free_ssd
+fi
+
+if [ "x$var_a" = "x1" ]
+then
+create_new_part
+fi
+
+if [ "x$var_a4" = "x1" ]
+then
+dumprestore_sys_fs
+
+# choose different proc in case of my generated image
+my_img=`echo ${deb8wildixnew_img} | grep "generated"`
+if [ -z "$my_img" ]
+then
+dumprestore_rw2_fs
+restore_net_conf_chroot /root/backup /mnt/4
+else
+restore_net_conf /root/backup /mnt/4
+fi
+cp_deb8_kern
+backup_menu2 /mnt/1
+set_deb8_boot
+echo Upgrade process completed. You may reboot. New system will boot by default. In case of some errors it will try to boot ths live system or your previous debian5.
+echo Also you can choose boot option via serial console.
+else # not var_a
+
+if [ "x$var_b" = "x1" ]
+then
+echo Var_b upgrade needs more work with grub2 reconfig or fstab ....
+exit
+echo "Do you agree to choose  var_b upgrade (rewrite SSD with new image) (yes\No)?"
+read agree
+
+if [ "x$agree" = "xyes" ]
+then
+dd_new_fs
+if [ "x$full_rw2_dump" = "x1" ]
+then
+# full dump restore of old rw2 partition on newly built FS
+restore_rw2_dump /mnt/deb8rw2
+else
+# restore only net config
+restore_net_conf_chroot /root/backup /mnt/deb8
+fi # variant of restoring rw2 conf
+fi # agree
+fi # bar_b
+fi # var_a
